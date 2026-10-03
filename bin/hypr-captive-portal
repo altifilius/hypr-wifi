@@ -1,112 +1,244 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 
-set -uo pipefail
+"""Intelligent captive portal detector and launcher for Hyprland."""
 
-readonly portal_fallback="http://ping.archlinux.org/nm-check.txt"
-readonly state_dir="${XDG_RUNTIME_DIR:-/tmp}/hypr-captive-portal"
-readonly opened_file="$state_dir/opened-activation"
-last_seen_activation=""
+from __future__ import annotations
 
-active_wifi() {
-    local device type state profile activation
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 
-    while IFS=: read -r device type state; do
-        [[ "$type" == "wifi" && "$state" == "connected" ]] || continue
 
-        profile="$(LC_ALL=C nmcli -g GENERAL.CONNECTION device show "$device" 2>/dev/null)" || continue
-        activation="$(LC_ALL=C nmcli -g GENERAL.CON-PATH device show "$device" 2>/dev/null)" || continue
-        [[ -n "$activation" && "$activation" != "--" ]] || activation="profile:$profile"
-        printf '%s\t%s\n' "$device|$activation" "$profile"
-        return 0
-    done < <(LC_ALL=C nmcli -t -e no -f DEVICE,TYPE,STATE device status 2>/dev/null)
+STATE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "hypr-captive-portal"
+OPENED_FILE = STATE_DIR / "opened-activation"
 
-    return 1
-}
 
-portal_uri() {
-    local signature quoted uri
+def get_default_gateway() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default", "dev", "wlan0"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for part in out.split():
+            if part.count(".") == 3 and not part.endswith("."):
+                return part
+    except Exception:
+        pass
+    return None
 
-    if read -r signature quoted < <(
-        busctl --system get-property \
-            org.freedesktop.NetworkManager \
-            /org/freedesktop/NetworkManager \
-            org.freedesktop.NetworkManager \
-            ConnectivityCheckUri 2>/dev/null
-    ); then
-        uri="${quoted#\"}"
-        uri="${uri%\"}"
-        if [[ "$signature" == "s" && "$uri" == http://* ]]; then
-            printf '%s\n' "$uri"
-            return 0
-        fi
-    fi
 
-    printf '%s\n' "$portal_fallback"
-}
+def get_active_wifi() -> tuple[str, str] | None:
+    """Returns (activation_id, profile_name) if Wi-Fi is connected."""
+    try:
+        out = subprocess.check_output(
+            ["nmcli", "-t", "-e", "no", "-f", "DEVICE,TYPE,STATE", "device", "status"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            parts = line.strip().split(":")
+            if len(parts) >= 3 and parts[1] == "wifi" and parts[2] == "connected":
+                device = parts[0]
+                prof = subprocess.check_output(
+                    ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", device],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                path = subprocess.check_output(
+                    ["nmcli", "-g", "GENERAL.CON-PATH", "device", "show", device],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                activation = path if path and path != "--" else f"profile:{prof}"
+                return (f"{device}|{activation}", prof or "Wi-Fi")
+    except Exception:
+        pass
+    return None
 
-open_portal() {
-    local profile="${1:-Wi-Fi}"
-    local uri
-    uri="$(portal_uri)"
 
-    notify-send \
-        --app-name="Wi-Fi" \
-        --icon="network-wireless-acquiring" \
-        "Wi-Fi girişi gerekiyor" \
-        "$profile giriş sayfası tarayıcıda açılıyor." 2>/dev/null || true
+def detect_portal_url() -> str | None:
+    """Probes endpoints for captive portal redirection."""
+    gateway = get_default_gateway()
 
-    xdg-open "$uri" >/dev/null 2>&1 &
-}
+    probes = [
+        ("http://detectportal.firefox.com/success.txt", 200, "success"),
+        ("http://connectivity-check.ubuntu.com/", 204, None),
+        ("http://www.gstatic.com/generate_204", 204, None),
+        ("http://www.msftconnecttest.com/connecttest.txt", 200, "Microsoft Connect Test"),
+    ]
 
-check_connectivity() {
-    local force="${1:-no}"
-    local wifi activation profile state opened=""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
 
-    if ! wifi="$(active_wifi)"; then
-        last_seen_activation=""
-        rm -f "$opened_file"
-        return 0
-    fi
+    opener = urllib.request.build_opener(NoRedirect)
 
-    IFS=$'\t' read -r activation profile <<<"$wifi"
+    for url, exp_code, exp_body in probes:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) CaptivePortalProbe/1.0"},
+            )
+            resp = opener.open(req, timeout=2.5)
+            code = resp.getcode()
+            body = resp.read(128).decode(errors="ignore").strip()
+            # If unexpected body or status, it's hijacked by captive portal
+            if code != exp_code or (exp_body and exp_body not in body):
+                return url
+        except urllib.error.HTTPError as err:
+            if err.code in (301, 302, 303, 307, 308):
+                loc = err.headers.get("Location")
+                if loc:
+                    return loc
+        except Exception:
+            pass
 
-    if [[ "$force" == "yes" || "$activation" != "$last_seen_activation" ]]; then
-        state="$(LC_ALL=C nmcli networking connectivity check 2>/dev/null || true)"
-        last_seen_activation="$activation"
-    else
-        state="$(LC_ALL=C nmcli -g CONNECTIVITY general status 2>/dev/null || true)"
-    fi
+    # If probes failed or got dropped, check gateway web interface
+    if gateway:
+        try:
+            req = urllib.request.Request(f"http://{gateway}/", headers={"User-Agent": "Mozilla/5.0"})
+            resp = opener.open(req, timeout=1.5)
+            return f"http://{gateway}/"
+        except urllib.error.HTTPError as err:
+            if err.code in (301, 302, 303, 307, 308):
+                loc = err.headers.get("Location")
+                if loc:
+                    return loc
+        except Exception:
+            pass
 
-    [[ "$state" == "portal" ]] || return 0
+    return None
 
-    mkdir -p "$state_dir"
-    [[ -r "$opened_file" ]] && IFS= read -r opened < "$opened_file"
-    [[ "$opened" != "$activation" ]] || return 0
 
-    printf '%s\n' "$activation" > "$opened_file"
-    open_portal "$profile"
-}
+def open_portal(profile: str = "Wi-Fi", explicit_url: str | None = None) -> None:
+    url = explicit_url or detect_portal_url()
+    if not url:
+        gateway = get_default_gateway()
+        url = f"http://{gateway}" if gateway else "http://neverssl.com"
 
-case "${1:-monitor}" in
-    monitor)
-        check_connectivity yes
-        while true; do
-            while IFS= read -r _; do
-                check_connectivity
-            done < <(LC_ALL=C stdbuf -oL nmcli monitor 2>&1)
-            sleep 1
-        done
-        ;;
-    check)
-        check_connectivity yes
-        ;;
-    open)
-        profile="$(active_wifi 2>/dev/null || true)"
-        profile="${profile#*$'\t'}"
-        open_portal "${profile:-Wi-Fi}"
-        ;;
-    *)
-        printf 'Usage: %s {monitor|check|open}\n' "${0##*/}" >&2
-        exit 2
-        ;;
-esac
+    try:
+        subprocess.Popen(
+            [
+                "notify-send",
+                "--app-name=Wi-Fi",
+                "--icon=network-wireless-acquiring",
+                "Wi-Fi Giriş Sayfası",
+                f"{profile} için oturum açma sayfası tarayıcıda açılıyor.",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+    try:
+        subprocess.Popen(
+            ["xdg-open", url],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as err:
+        print(f"Tarayıcı açılamadı: {err}", file=sys.stderr)
+
+
+def check_and_trigger(force: bool = False) -> None:
+    wifi = get_active_wifi()
+    if not wifi:
+        try:
+            OPENED_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+
+    activation, profile = wifi
+
+    # Check NM connectivity
+    nm_state = ""
+    try:
+        nm_state = subprocess.check_output(
+            ["nmcli", "-g", "CONNECTIVITY", "general", "status"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        pass
+
+    # If NM explicitly reports portal OR limited, check actively
+    is_portal = False
+    portal_url = None
+
+    if nm_state == "portal":
+        is_portal = True
+    elif nm_state in ("limited", "unknown", "none") or force:
+        portal_url = detect_portal_url()
+        if portal_url:
+            is_portal = True
+
+    if not is_portal and not force:
+        return
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    opened = ""
+    if OPENED_FILE.exists():
+        try:
+            opened = OPENED_FILE.read_text().strip()
+        except Exception:
+            pass
+
+    if not force and opened == activation:
+        return
+
+    try:
+        OPENED_FILE.write_text(activation)
+    except Exception:
+        pass
+
+    open_portal(profile, explicit_url=portal_url)
+
+
+def monitor_loop() -> None:
+    check_and_trigger(force=False)
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["nmcli", "monitor"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            if proc.stdout:
+                for _ in proc.stdout:
+                    time.sleep(0.5)
+                    check_and_trigger(force=False)
+        except Exception:
+            time.sleep(2)
+
+
+def main() -> int:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "monitor"
+
+    if mode == "monitor":
+        monitor_loop()
+    elif mode == "check":
+        check_and_trigger(force=True)
+    elif mode == "open":
+        wifi = get_active_wifi()
+        profile = wifi[1] if wifi else "Wi-Fi"
+        open_portal(profile=profile)
+    else:
+        print(f"Usage: {sys.argv[0]} {{monitor|check|open}}", file=sys.stderr)
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

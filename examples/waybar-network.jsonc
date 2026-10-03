@@ -1,8 +1,8 @@
 {
   "network": {
     "interval": 1,
-    "format-wifi": "󰤨  {essid}",
-    "format-ethernet": "󰈀  LAN",
+    "format-wifi": "  ↓{bandwidthDownBytes} ↑{bandwidthUpBytes}  {essid}",
+    "format-ethernet": "󰈀  ↓{bandwidthDownBytes} ↑{bandwidthUpBytes}  LAN",
     "format-linked": "󰈀  LINK",
     "format-disconnected": "󰤭  OFFLINE",
     "tooltip-format-wifi": "{essid}\n{ifname} · {ipaddr}/{cidr}\nSignal {signalStrength}%\nDownload {bandwidthDownBytes}\nUpload {bandwidthUpBytes}\nLeft: networks · Right: tools · Middle: portal",

@@ -38,15 +38,21 @@ class NetworkWindow(Adw.ApplicationWindow):
     def __init__(self, application: Adw.Application) -> None:
         super().__init__(application=application)
         self.set_title("Ağlar")
-        self.set_default_size(620, 700)
+        self.set_default_size(620, 720)
 
         self.client = NM.Client.new(None)
         self.device = next(
             (device for device in self.client.get_devices() if isinstance(device, NM.DeviceWifi)),
             None,
         )
+
         self.network_rows: list[Gtk.Widget] = []
+        self.active_card_rows: list[Gtk.Widget] = []
         self.updating_radio = False
+        self.connecting_ssid: str | None = None
+        self.disconnecting = False
+        self.is_dialog_open = False
+        self._refresh_timer_id: int | None = None
 
         self.toast_overlay = Adw.ToastOverlay()
         self.stack = Adw.ViewStack()
@@ -63,7 +69,7 @@ class NetworkWindow(Adw.ApplicationWindow):
 
         self.refresh_button = Gtk.Button(icon_name="view-refresh-symbolic")
         self.refresh_button.set_tooltip_text("Ağları yeniden tara")
-        self.refresh_button.connect("clicked", lambda _button: self.scan())
+        self.refresh_button.connect("clicked", lambda _b: self.scan())
         header.pack_end(self.refresh_button)
         toolbar.add_top_bar(header)
         self.set_content(toolbar)
@@ -71,22 +77,32 @@ class NetworkWindow(Adw.ApplicationWindow):
         self._build_network_page()
         self._build_tools_page()
 
-        self.client.connect("notify::wireless-enabled", self._state_changed)
+        self.client.connect("notify::wireless-enabled", self._on_nm_notify)
+        self.client.connect("notify::active-connections", self._on_nm_notify)
         if self.device is not None:
-            self.device.connect("notify::active-access-point", self._state_changed)
-            self.device.connect("notify::state", self._state_changed)
+            self.device.connect("notify::active-access-point", self._on_nm_notify)
+            self.device.connect("notify::state", self._on_nm_notify)
 
         self.refresh()
         self.scan()
 
     def _build_network_page(self) -> None:
         page = Adw.PreferencesPage()
-        self.network_group = Adw.PreferencesGroup(
-            title="Yakındaki Ağlar",
-            description="Bir ağa bağlanmak için seçin. Güçlü ağlar önce gösterilir.",
+
+        # Group 1: Connected Network Card
+        self.active_group = Adw.PreferencesGroup(title="Bağlı Ağ")
+        page.add(self.active_group)
+
+        # Group 2: Available Networks
+        self.available_group = Adw.PreferencesGroup(
+            title="Kullanılabilir Ağlar",
+            description="Bağlanmak istediğiniz ağı seçin.",
         )
-        page.add(self.network_group)
-        self.stack.add_titled(page, "networks", "Wi-Fi Ağları")
+        page.add(self.available_group)
+
+        self.stack.add_titled_with_icon(
+            page, "networks", "Wi-Fi Ağları", "network-wireless-symbolic"
+        )
 
     def _build_tools_page(self) -> None:
         page = Adw.PreferencesPage()
@@ -109,7 +125,6 @@ class NetworkWindow(Adw.ApplicationWindow):
         self.hotspot_button.add_css_class("suggested-action")
         self.hotspot_button.connect("clicked", self._hotspot_clicked)
         self.hotspot_row.add_suffix(self.hotspot_button)
-        self.hotspot_row.set_activatable_widget(self.hotspot_button)
         hotspot_group.add(self.hotspot_row)
         page.add(hotspot_group)
 
@@ -121,10 +136,9 @@ class NetworkWindow(Adw.ApplicationWindow):
         )
         profiles_button = Gtk.Button(label="Aç", valign=Gtk.Align.CENTER)
         profiles_button.connect(
-            "clicked", lambda _button: self._launch(["nm-connection-editor"])
+            "clicked", lambda _b: self._launch(["nm-connection-editor"])
         )
         profiles.add_suffix(profiles_button)
-        profiles.set_activatable_widget(profiles_button)
         advanced_group.add(profiles)
 
         hidden = Adw.ActionRow(
@@ -134,12 +148,11 @@ class NetworkWindow(Adw.ApplicationWindow):
         hidden_button = Gtk.Button(label="Ekle", valign=Gtk.Align.CENTER)
         hidden_button.connect(
             "clicked",
-            lambda _button: self._launch(
+            lambda _b: self._launch(
                 ["nm-connection-editor", "--create", "--type=wifi"]
             ),
         )
         hidden.add_suffix(hidden_button)
-        hidden.set_activatable_widget(hidden_button)
         advanced_group.add(hidden)
 
         portal = Adw.ActionRow(
@@ -148,14 +161,15 @@ class NetworkWindow(Adw.ApplicationWindow):
         )
         portal_button = Gtk.Button(label="Aç", valign=Gtk.Align.CENTER)
         portal_button.connect(
-            "clicked", lambda _button: self._launch(["hypr-captive-portal", "open"])
+            "clicked", lambda _b: self._launch(["hypr-captive-portal", "open"])
         )
         portal.add_suffix(portal_button)
-        portal.set_activatable_widget(portal_button)
         advanced_group.add(portal)
 
         page.add(advanced_group)
-        self.stack.add_titled(page, "tools", "Araçlar")
+        self.stack.add_titled_with_icon(
+            page, "tools", "Araçlar", "preferences-system-symbolic"
+        )
 
     def show_page(self, name: str) -> None:
         self.stack.set_visible_child_name(name)
@@ -175,8 +189,19 @@ class NetworkWindow(Adw.ApplicationWindow):
     def toast(self, message: str) -> None:
         self.toast_overlay.add_toast(Adw.Toast(title=message, timeout=4))
 
-    def _state_changed(self, *_args: object) -> None:
-        GLib.idle_add(self.refresh)
+    def _on_nm_notify(self, *_args: object) -> None:
+        self._schedule_refresh(250)
+
+    def _schedule_refresh(self, delay_ms: int = 300) -> None:
+        if self._refresh_timer_id is not None:
+            GLib.source_remove(self._refresh_timer_id)
+        self._refresh_timer_id = GLib.timeout_add(delay_ms, self._do_scheduled_refresh)
+
+    def _do_scheduled_refresh(self) -> bool:
+        self._refresh_timer_id = None
+        if not self.is_dialog_open:
+            self.refresh()
+        return GLib.SOURCE_REMOVE
 
     def scan(self) -> None:
         if self.device is None or not self.client.wireless_get_enabled():
@@ -201,7 +226,7 @@ class NetworkWindow(Adw.ApplicationWindow):
             if "not allowed" not in error.message.lower():
                 self.toast(f"Tarama tamamlanamadı: {error.message}")
         self.refresh_button.set_sensitive(True)
-        GLib.timeout_add(700, self.refresh)
+        self._schedule_refresh(300)
 
     def refresh(self) -> bool:
         self._refresh_radio()
@@ -221,7 +246,7 @@ class NetworkWindow(Adw.ApplicationWindow):
             return
         self.client.wireless_set_enabled(row.get_active())
         self.toast("Wi-Fi açılıyor" if row.get_active() else "Wi-Fi kapatılıyor")
-        GLib.timeout_add(800, self.refresh)
+        self._schedule_refresh(500)
 
     @staticmethod
     def _ssid(ap: NM.AccessPoint) -> str:
@@ -231,9 +256,7 @@ class NetworkWindow(Adw.ApplicationWindow):
         return NM.utils_ssid_to_utf8(raw.get_data()) or ""
 
     def _saved_connection(self, ssid: str) -> NM.RemoteConnection | None:
-        if self.device is None:
-            return None
-        for connection in self.device.get_available_connections():
+        for connection in self.client.get_connections():
             wireless = connection.get_setting_wireless()
             if wireless is None or wireless.get_ssid() is None:
                 continue
@@ -241,6 +264,16 @@ class NetworkWindow(Adw.ApplicationWindow):
             if saved_ssid == ssid:
                 return connection
         return None
+
+    @staticmethod
+    def _signal_icon_name(strength: int) -> str:
+        if strength >= 80:
+            return "network-wireless-signal-excellent-symbolic"
+        if strength >= 55:
+            return "network-wireless-signal-good-symbolic"
+        if strength >= 30:
+            return "network-wireless-signal-ok-symbolic"
+        return "network-wireless-signal-weak-symbolic"
 
     @staticmethod
     def _security(ap: NM.AccessPoint) -> tuple[str, str | None]:
@@ -260,11 +293,31 @@ class NetworkWindow(Adw.ApplicationWindow):
             return "WEP", None
         return "Açık ağ", ""
 
+    def _get_active_wifi_info(self) -> tuple[str, str]:
+        """Returns (active_ssid, active_ip)"""
+        if self.device is None:
+            return "", ""
+        active_conn = self.device.get_active_connection()
+        if active_conn is None:
+            return "", ""
+        conn = active_conn.get_connection()
+        s_wifi = conn.get_setting_wireless() if conn else None
+        ssid = ""
+        if s_wifi and s_wifi.get_ssid():
+            ssid = NM.utils_ssid_to_utf8(s_wifi.get_ssid().get_data()) or ""
+        ip = ""
+        ip4 = self.device.get_ip4_config()
+        if ip4:
+            addresses = ip4.get_addresses()
+            if addresses:
+                ip = addresses[0].get_address()
+        return ssid, ip
+
     def _access_points(self) -> list[AccessPointInfo]:
         if self.device is None:
             return []
 
-        active_ap = self.device.get_active_access_point()
+        active_ssid, _ = self._get_active_wifi_info()
         strongest: dict[str, NM.AccessPoint] = {}
         for ap in self.device.get_access_points():
             ssid = self._ssid(ap)
@@ -284,138 +337,267 @@ class NetworkWindow(Adw.ApplicationWindow):
                     strength=ap.get_strength(),
                     security=security,
                     key_mgmt=key_mgmt,
-                    active=active_ap is not None and ap.get_path() == active_ap.get_path(),
+                    active=(bool(active_ssid) and ssid == active_ssid),
                     saved=self._saved_connection(ssid),
                 )
             )
-        return sorted(result, key=lambda item: (not item.active, -item.strength, item.ssid.casefold()))
+        return sorted(
+            result,
+            key=lambda item: (not item.active, -item.strength, item.ssid.casefold()),
+        )
+
+    def _clear_group(self, group: Adw.PreferencesGroup, rows: list[Gtk.Widget]) -> None:
+        for row in rows:
+            group.remove(row)
+        rows.clear()
 
     def _refresh_networks(self) -> None:
-        for row in self.network_rows:
-            self.network_group.remove(row)
-        self.network_rows.clear()
+        self._clear_group(self.active_group, self.active_card_rows)
+        self._clear_group(self.available_group, self.network_rows)
 
         if self.device is None:
+            self.active_group.set_visible(False)
             row = Adw.ActionRow(
                 title="Wi-Fi adaptörü bulunamadı",
                 subtitle="NetworkManager tarafından yönetilen kablosuz aygıt yok.",
             )
-            self.network_group.add(row)
+            self.available_group.add(row)
             self.network_rows.append(row)
             return
 
         if not self.client.wireless_get_enabled():
+            self.active_group.set_visible(False)
             row = Adw.ActionRow(
                 title="Wi-Fi kapalı",
                 subtitle="Araçlar sekmesinden Wi-Fi'yi açın.",
             )
-            self.network_group.add(row)
+            self.available_group.add(row)
             self.network_rows.append(row)
             return
 
         access_points = self._access_points()
-        if not access_points:
+        active_ssid, active_ip = self._get_active_wifi_info()
+
+        # Render Active Network Card
+        active_info = next((ap for ap in access_points if ap.active), None)
+        if active_info is not None:
+            self.active_group.set_visible(True)
+            active_row = Adw.ActionRow(title=active_info.ssid)
+            sub_parts = ["Bağlı"]
+            if active_ip:
+                sub_parts.append(f"IP: {active_ip}")
+            sub_parts.append(f"Sinyal %{active_info.strength}")
+            sub_parts.append(active_info.security)
+            active_row.set_subtitle(" · ".join(sub_parts))
+
+            icon = Gtk.Image.new_from_icon_name(self._signal_icon_name(active_info.strength))
+            active_row.add_prefix(icon)
+
+            disconnect_btn = Gtk.Button(valign=Gtk.Align.CENTER)
+            disconnect_btn.add_css_class("destructive-action")
+            if self.disconnecting:
+                disconnect_btn.set_sensitive(False)
+                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                spinner = Gtk.Spinner(spinning=True)
+                box.append(spinner)
+                box.append(Gtk.Label(label="Kesiliyor…"))
+                disconnect_btn.set_child(box)
+            else:
+                disconnect_btn.set_label("Bağlantıyı Kes")
+                disconnect_btn.connect("clicked", lambda _b: self._disconnect())
+
+            active_row.add_suffix(disconnect_btn)
+            self.active_group.add(active_row)
+            self.active_card_rows.append(active_row)
+        else:
+            self.active_group.set_visible(False)
+
+        # Render Available Networks
+        available_list = [ap for ap in access_points if not ap.active]
+        if not available_list:
             row = Adw.ActionRow(
-                title="Ağ bulunamadı",
+                title="Çevrede ağ bulunamadı",
                 subtitle="Yenile düğmesiyle tekrar tarayın.",
             )
-            self.network_group.add(row)
+            self.available_group.add(row)
             self.network_rows.append(row)
             return
 
-        for info in access_points:
+        for info in available_list:
             subtitle_parts = [f"Sinyal %{info.strength}", info.security]
             if info.saved is not None:
                 subtitle_parts.append("Kayıtlı")
+            elif info.key_mgmt in {"wpa-psk", "sae"} or info.security != "Açık ağ":
+                subtitle_parts.append("Parolalı")
+            else:
+                subtitle_parts.append("Açık")
+
             row = Adw.ActionRow(title=info.ssid, subtitle=" · ".join(subtitle_parts))
-            icon = Gtk.Image.new_from_icon_name(
-                "network-wireless-encrypted-symbolic"
-                if info.security != "Açık ağ"
-                else "network-wireless-symbolic"
-            )
+            icon = Gtk.Image.new_from_icon_name(self._signal_icon_name(info.strength))
             row.add_prefix(icon)
 
-            button = Gtk.Button(
-                label="Bağlı" if info.active else "Bağlan",
-                valign=Gtk.Align.CENTER,
-            )
-            if info.active:
-                button.add_css_class("suggested-action")
-                button.set_sensitive(False)
+            action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            action_box.set_valign(Gtk.Align.CENTER)
+
+            if info.saved is not None and self.connecting_ssid != info.ssid:
+                forget_btn = Gtk.Button(
+                    icon_name="user-trash-symbolic",
+                    valign=Gtk.Align.CENTER,
+                )
+                forget_btn.add_css_class("flat")
+                forget_btn.set_tooltip_text("Kayıtlı profili sil / unut")
+                forget_btn.connect(
+                    "clicked",
+                    lambda _b, conn=info.saved, name=info.ssid: self._forget_connection(conn, name),
+                )
+                action_box.append(forget_btn)
+
+            connect_btn = Gtk.Button(valign=Gtk.Align.CENTER)
+            if self.connecting_ssid == info.ssid:
+                connect_btn.set_sensitive(False)
+                c_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                c_spinner = Gtk.Spinner(spinning=True)
+                c_box.append(c_spinner)
+                c_box.append(Gtk.Label(label="Bağlanıyor…"))
+                connect_btn.set_child(c_box)
             else:
-                button.connect("clicked", lambda _button, item=info: self._connect(item))
-            row.add_suffix(button)
-            row.set_activatable_widget(button)
-            self.network_group.add(row)
+                connect_btn.set_label("Bağlan")
+                if info.saved is not None:
+                    connect_btn.add_css_class("suggested-action")
+                connect_btn.connect(
+                    "clicked",
+                    lambda _b, item=info: self._connect(item),
+                )
+
+            action_box.append(connect_btn)
+            row.add_suffix(action_box)
+
+            # Row activation connects cleanly
+            row.set_activatable(self.connecting_ssid is None)
+            row.connect("activated", lambda _r, item=info: self._connect(item))
+
+            self.available_group.add(row)
             self.network_rows.append(row)
 
     def _connect(self, info: AccessPointInfo) -> None:
-        if self.device is None:
+        if self.device is None or self.connecting_ssid is not None:
             return
+
         if info.saved is not None:
+            self.connecting_ssid = info.ssid
+            self._schedule_refresh(50)
             self.toast(f"{info.ssid} ağına bağlanılıyor…")
             self.client.activate_connection_async(
                 info.saved,
                 self.device,
-                info.ap.get_path(),
+                None,
                 None,
                 self._activation_finished,
-                info.ssid,
+                info,
             )
             return
 
-        if info.key_mgmt in {"wpa-psk", "sae"}:
+        if info.key_mgmt in {"wpa-psk", "sae"} or info.security != "Açık ağ":
             self._show_password_dialog(info)
             return
 
+        self.connecting_ssid = info.ssid
+        self._schedule_refresh(50)
         self.toast(f"{info.ssid} ağına bağlanılıyor…")
         self.client.add_and_activate_connection_async(
             None,
             self.device,
-            info.ap.get_path(),
+            None,
             None,
             self._add_activation_finished,
-            info.ssid,
+            info,
         )
 
     def _show_password_dialog(self, info: AccessPointInfo) -> None:
-        dialog = Gtk.Dialog(title=info.ssid, transient_for=self, modal=True)
-        dialog.add_button("İptal", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Bağlan", Gtk.ResponseType.OK)
-        dialog.set_default_response(Gtk.ResponseType.OK)
+        self.is_dialog_open = True
+        dialog = Adw.AlertDialog(
+            heading=info.ssid,
+            body=(
+                f"{info.security} ağı için parolayı girin.\n"
+                "Captive portal varsa bağlantı sağlandıktan sonra tarayıcıda açılır."
+            ),
+        )
 
-        box = dialog.get_content_area()
-        box.set_spacing(12)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content_box.set_margin_top(6)
+        content_box.set_margin_bottom(6)
 
-        label = Gtk.Label(label=f"{info.security} ağ parolasını girin.", xalign=0)
-        password = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
-        password.set_placeholder_text("En az 8 karakter")
+        content_box.append(Gtk.Label(label="Parola (en az 8 karakter)", xalign=0))
+        password_entry = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
         error_label = Gtk.Label(xalign=0)
         error_label.add_css_class("error")
-        box.append(label)
-        box.append(password)
-        box.append(error_label)
 
-        def response(_dialog: Gtk.Dialog, response_id: int) -> None:
-            if response_id != Gtk.ResponseType.OK:
-                dialog.destroy()
-                return
-            value = password.get_text()
-            if not 8 <= len(value.encode("utf-8")) <= 63:
-                error_label.set_text("Parola 8–63 bayt olmalıdır.")
-                return
-            dialog.destroy()
-            self._connect_with_password(info, value)
+        content_box.append(password_entry)
+        content_box.append(error_label)
+        dialog.set_extra_child(content_box)
 
-        dialog.connect("response", response)
-        dialog.present()
+        dialog.add_response("cancel", "İptal")
+        dialog.add_response("connect", "Bağlan")
+        dialog.set_response_appearance("connect", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("connect")
+        dialog.set_close_response("cancel")
+
+        def on_response(dlg: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
+            response_id = dlg.choose_finish(result)
+            self.is_dialog_open = False
+            if response_id != "connect":
+                self.connecting_ssid = None
+                self._schedule_refresh(100)
+                return
+
+            val = password_entry.get_text().strip()
+            if not 8 <= len(val.encode("utf-8")) <= 63:
+                self.toast("Parola 8–63 karakter olmalıdır.")
+                self.connecting_ssid = None
+                self._schedule_refresh(100)
+                # Re-open dialog on invalid password length
+                GLib.timeout_add(200, lambda: self._show_password_dialog(info))
+                return
+
+            self._connect_with_password(info, val)
+
+        dialog.choose(self, None, on_response)
 
     def _connect_with_password(self, info: AccessPointInfo, password: str) -> None:
-        if self.device is None or info.key_mgmt is None:
+        if self.device is None:
+            return
+        key_mgmt = info.key_mgmt or "wpa-psk"
+        self.connecting_ssid = info.ssid
+        self._schedule_refresh(50)
+
+        if info.saved is not None:
+            security = info.saved.get_setting_wireless_security()
+            if security is None:
+                security = NM.SettingWirelessSecurity.new()
+                info.saved.add_setting(security)
+            security.props.key_mgmt = key_mgmt
+            security.props.psk = password
+            security.props.psk_flags = 0
+
+            def on_committed(conn: NM.RemoteConnection, res: Gio.AsyncResult) -> None:
+                try:
+                    conn.commit_changes_finish(res)
+                except GLib.Error as err:
+                    self.connecting_ssid = None
+                    self.toast(f"Parola kaydedilemedi: {err.message}")
+                    self._schedule_refresh(200)
+                    return
+                self.toast(f"{info.ssid} ağına bağlanılıyor…")
+                self.client.activate_connection_async(
+                    conn,
+                    self.device,
+                    None,
+                    None,
+                    self._activation_finished,
+                    info,
+                )
+
+            info.saved.commit_changes_async(True, None, on_committed)
             return
 
         connection = NM.SimpleConnection.new()
@@ -431,8 +613,9 @@ class NetworkWindow(Adw.ApplicationWindow):
         connection.add_setting(wireless)
 
         security = NM.SettingWirelessSecurity.new()
-        security.props.key_mgmt = info.key_mgmt
+        security.props.key_mgmt = key_mgmt
         security.props.psk = password
+        security.props.psk_flags = 0
         connection.add_setting(security)
 
         ipv4 = NM.SettingIP4Config.new()
@@ -446,39 +629,125 @@ class NetworkWindow(Adw.ApplicationWindow):
         self.client.add_and_activate_connection_async(
             connection,
             self.device,
-            info.ap.get_path(),
+            None,
             None,
             self._add_activation_finished,
-            info.ssid,
+            info,
         )
+
+    def _disconnect(self) -> None:
+        if self.device is None or self.disconnecting:
+            return
+        self.disconnecting = True
+        self._schedule_refresh(50)
+        self.toast("Bağlantı kesiliyor…")
+        self.device.disconnect_async(None, self._disconnect_finished, None)
+
+    def _disconnect_finished(
+        self,
+        device: NM.Device,
+        result: Gio.AsyncResult,
+        _user_data: object,
+    ) -> None:
+        self.disconnecting = False
+        try:
+            device.disconnect_finish(result)
+            self.toast("Bağlantı kesildi")
+        except GLib.Error as error:
+            self.toast(f"Bağlantı kesilemedi: {error.message}")
+        self._schedule_refresh(200)
+
+    def _forget_connection(self, connection: NM.RemoteConnection, ssid: str) -> None:
+        def on_deleted(_conn: NM.RemoteConnection, result: Gio.AsyncResult) -> None:
+            try:
+                connection.delete_finish(result)
+                self.toast(f"{ssid} profili silindi")
+            except GLib.Error as error:
+                self.toast(f"Profil silinemedi: {error.message}")
+            self._schedule_refresh(200)
+
+        connection.delete_async(None, on_deleted)
+
+    def _track_activation(
+        self,
+        active_conn: NM.ActiveConnection,
+        info: AccessPointInfo,
+    ) -> None:
+        if active_conn.get_state() == NM.ActiveConnectionState.ACTIVATED:
+            self.connecting_ssid = None
+            self.toast(f"{info.ssid} ağına bağlandı")
+            self._schedule_refresh(200)
+            return
+
+        def on_notify_state(conn: NM.ActiveConnection, _param: object) -> None:
+            state = conn.get_state()
+            if state == NM.ActiveConnectionState.ACTIVATED:
+                self.connecting_ssid = None
+                self.toast(f"{info.ssid} ağına bağlandı")
+                self._schedule_refresh(200)
+            elif state in (
+                NM.ActiveConnectionState.DEACTIVATING,
+                NM.ActiveConnectionState.DEACTIVATED,
+            ):
+                reason = self.device.get_state_reason() if self.device else 0
+                self.connecting_ssid = None
+                if reason in (
+                    NM.DeviceStateReason.NO_SECRETS,
+                    NM.DeviceStateReason.SUPPLICANT_DISCONNECT,
+                    NM.DeviceStateReason.SUPPLICANT_CONFIG_FAILED,
+                ):
+                    self.toast(f"{info.ssid}: Parola yanlış veya doğrulama başarısız")
+                    if info.key_mgmt in {"wpa-psk", "sae"} or info.security != "Açık ağ":
+                        GLib.timeout_add(300, lambda: self._show_password_dialog(info))
+                        return
+                else:
+                    self.toast(f"{info.ssid} bağlantısı kurulamadı")
+                self._schedule_refresh(300)
+
+        active_conn.connect("notify::state", on_notify_state)
 
     def _activation_finished(
         self,
         client: NM.Client,
         result: Gio.AsyncResult,
-        ssid: str,
+        info: AccessPointInfo,
     ) -> None:
         try:
-            client.activate_connection_finish(result)
+            active_conn = client.activate_connection_finish(result)
         except GLib.Error as error:
-            self.toast(f"{ssid}: {error.message}")
+            self.connecting_ssid = None
+            message = error.message
+            lower = message.lower()
+            if any(term in lower for term in ("secret", "auth", "parola", "agent")):
+                self.toast(f"{info.ssid}: Wi-Fi parolası gerekli")
+                if info.key_mgmt in {"wpa-psk", "sae"} or info.security != "Açık ağ":
+                    GLib.timeout_add(200, lambda: self._show_password_dialog(info))
+                    return
+            self.toast(f"{info.ssid}: {message}")
+            self._schedule_refresh(200)
             return
-        self.toast(f"{ssid} bağlantısı başlatıldı")
-        GLib.timeout_add(900, self.refresh)
+
+        if active_conn is not None:
+            self._track_activation(active_conn, info)
+        self.toast(f"{info.ssid} bağlantısı başlatıldı…")
 
     def _add_activation_finished(
         self,
         client: NM.Client,
         result: Gio.AsyncResult,
-        name: str,
+        info: AccessPointInfo,
     ) -> None:
         try:
-            client.add_and_activate_connection_finish(result)
+            active_conn = client.add_and_activate_connection_finish(result)
         except GLib.Error as error:
-            self.toast(f"{name}: {error.message}")
+            self.connecting_ssid = None
+            self.toast(f"{info.ssid}: {error.message}")
+            self._schedule_refresh(200)
             return
-        self.toast(f"{name} bağlantısı başlatıldı")
-        GLib.timeout_add(900, self.refresh)
+
+        if active_conn is not None:
+            self._track_activation(active_conn, info)
+        self.toast(f"{info.ssid} bağlantısı başlatıldı…")
 
     def _active_hotspot(self) -> NM.ActiveConnection | None:
         if self.device is None:
@@ -538,63 +807,60 @@ class NetworkWindow(Adw.ApplicationWindow):
             self.toast(f"Hotspot durdurulamadı: {error.message}")
             return
         self.toast("Hotspot durduruldu")
-        GLib.timeout_add(600, self.refresh)
+        self._schedule_refresh(300)
 
     def _show_hotspot_dialog(self) -> None:
         if self.device is None:
             self.toast("Wi-Fi adaptörü bulunamadı")
             return
 
-        dialog = Gtk.Dialog(title="Hotspot Oluştur", transient_for=self, modal=True)
-        dialog.add_button("İptal", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Oluştur", Gtk.ResponseType.OK)
-        dialog.set_default_response(Gtk.ResponseType.OK)
-
-        box = dialog.get_content_area()
-        box.set_spacing(12)
-        box.set_margin_top(18)
-        box.set_margin_bottom(18)
-        box.set_margin_start(18)
-        box.set_margin_end(18)
-
-        warning = Gtk.Label(
-            label="Hotspot başlatıldığında mevcut Wi-Fi bağlantısı kesilir.",
-            xalign=0,
-            wrap=True,
+        self.is_dialog_open = True
+        dialog = Adw.AlertDialog(
+            heading="Hotspot Oluştur",
+            body="Hotspot başlatıldığında mevcut Wi-Fi bağlantısı kesilir.",
         )
-        warning.add_css_class("warning")
-        ssid = Gtk.Entry(text=f"{socket.gethostname()}-Hotspot")
-        ssid.set_placeholder_text("Ağ adı")
-        password = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
-        password.set_text(secrets.token_urlsafe(9))
-        password.set_placeholder_text("En az 8 karakter")
-        error_label = Gtk.Label(xalign=0, wrap=True)
-        error_label.add_css_class("error")
 
-        box.append(warning)
-        box.append(Gtk.Label(label="Ağ adı", xalign=0))
-        box.append(ssid)
-        box.append(Gtk.Label(label="Parola", xalign=0))
-        box.append(password)
-        box.append(error_label)
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content_box.set_margin_top(6)
+        content_box.set_margin_bottom(6)
 
-        def response(_dialog: Gtk.Dialog, response_id: int) -> None:
-            if response_id != Gtk.ResponseType.OK:
-                dialog.destroy()
-                return
-            ssid_value = ssid.get_text().strip()
-            password_value = password.get_text()
-            if not ssid_value or len(ssid_value.encode("utf-8")) > 32:
-                error_label.set_text("Ağ adı 1–32 bayt olmalıdır.")
-                return
-            if not 8 <= len(password_value.encode("utf-8")) <= 63:
-                error_label.set_text("Parola 8–63 bayt olmalıdır.")
-                return
-            dialog.destroy()
-            self._create_hotspot(ssid_value, password_value)
+        ssid_entry = Gtk.Entry(text=f"{socket.gethostname()}-Hotspot")
+        ssid_entry.set_placeholder_text("Ağ adı")
+        password_entry = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
+        password_entry.set_text(secrets.token_urlsafe(9))
+        content_box.append(Gtk.Label(label="Ağ Adı", xalign=0))
+        content_box.append(ssid_entry)
+        content_box.append(Gtk.Label(label="Parola", xalign=0))
+        content_box.append(password_entry)
+        dialog.set_extra_child(content_box)
 
-        dialog.connect("response", response)
-        dialog.present()
+        dialog.add_response("cancel", "İptal")
+        dialog.add_response("create", "Oluştur")
+        dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("create")
+        dialog.set_close_response("cancel")
+
+        def on_response(dlg: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
+            response_id = dlg.choose_finish(result)
+            self.is_dialog_open = False
+            if response_id != "create":
+                self._schedule_refresh(100)
+                return
+
+            ssid_val = ssid_entry.get_text().strip()
+            pass_val = password_entry.get_text()
+            if not ssid_val or len(ssid_val.encode("utf-8")) > 32:
+                self.toast("Ağ adı 1–32 bayt olmalıdır.")
+                self._schedule_refresh(100)
+                return
+            if not 8 <= len(pass_val.encode("utf-8")) <= 63:
+                self.toast("Parola 8–63 bayt olmalıdır.")
+                self._schedule_refresh(100)
+                return
+
+            self._create_hotspot(ssid_val, pass_val)
+
+        dialog.choose(self, None, on_response)
 
     def _create_hotspot(self, ssid: str, password: str) -> None:
         if self.device is None:
@@ -617,6 +883,7 @@ class NetworkWindow(Adw.ApplicationWindow):
         security = NM.SettingWirelessSecurity.new()
         security.props.key_mgmt = "wpa-psk"
         security.props.psk = password
+        security.props.psk_flags = 0
         connection.add_setting(security)
 
         ipv4 = NM.SettingIP4Config.new()
@@ -639,7 +906,15 @@ class NetworkWindow(Adw.ApplicationWindow):
             None,
             None,
             self._add_activation_finished,
-            ssid,
+            AccessPointInfo(
+                ap=None,  # type: ignore[arg-type]
+                ssid=ssid,
+                strength=100,
+                security="WPA2",
+                key_mgmt="wpa-psk",
+                active=True,
+                saved=None,
+            ),
         )
 
 

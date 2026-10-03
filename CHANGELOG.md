@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0 — 2026-10-03
+
+- Add dedicated connected-network status card with instant disconnect button.
+- Add multi-probe captive portal detector (Mozilla, Ubuntu, Google, Microsoft, and Gateway IP).
+- Replace deprecated dialogs with native `Adw.AlertDialog` prompts.
+- Add debounced event loop to eliminate GTK widget thrashing during rapid D-Bus state changes.
+- Add inline profile forget/deletion buttons for saved networks.
+- Store Wi-Fi credentials with `psk_flags = 0` to persist system keyfiles without external agents.
+- Update Waybar network format with real-time download and upload speeds.
+
 ## 1.0.0 — 2026-10-03
 
 - Add a GTK 4/libadwaita Wi-Fi network list backed by libnm.
