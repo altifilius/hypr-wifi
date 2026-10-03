@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+readonly portal_fallback="http://ping.archlinux.org/nm-check.txt"
+readonly state_dir="${XDG_RUNTIME_DIR:-/tmp}/hypr-captive-portal"
+readonly opened_file="$state_dir/opened-activation"
+last_seen_activation=""
+
+active_wifi() {
+    local device type state profile activation
+
+    while IFS=: read -r device type state; do
+        [[ "$type" == "wifi" && "$state" == "connected" ]] || continue
+
+        profile="$(LC_ALL=C nmcli -g GENERAL.CONNECTION device show "$device" 2>/dev/null)" || continue
+        activation="$(LC_ALL=C nmcli -g GENERAL.CON-PATH device show "$device" 2>/dev/null)" || continue
+        [[ -n "$activation" && "$activation" != "--" ]] || activation="profile:$profile"
+        printf '%s\t%s\n' "$device|$activation" "$profile"
+        return 0
+    done < <(LC_ALL=C nmcli -t -e no -f DEVICE,TYPE,STATE device status 2>/dev/null)
+
+    return 1
+}
+
+portal_uri() {
+    local signature quoted uri
+
+    if read -r signature quoted < <(
+        busctl --system get-property \
+            org.freedesktop.NetworkManager \
+            /org/freedesktop/NetworkManager \
+            org.freedesktop.NetworkManager \
+            ConnectivityCheckUri 2>/dev/null
+    ); then
+        uri="${quoted#\"}"
+        uri="${uri%\"}"
+        if [[ "$signature" == "s" && "$uri" == http://* ]]; then
+            printf '%s\n' "$uri"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$portal_fallback"
+}
+
+open_portal() {
+    local profile="${1:-Wi-Fi}"
+    local uri
+    uri="$(portal_uri)"
+
+    notify-send \
+        --app-name="Wi-Fi" \
+        --icon="network-wireless-acquiring" \
+        "Wi-Fi girişi gerekiyor" \
+        "$profile giriş sayfası tarayıcıda açılıyor." 2>/dev/null || true
+
+    xdg-open "$uri" >/dev/null 2>&1 &
+}
+
+check_connectivity() {
+    local force="${1:-no}"
+    local wifi activation profile state opened=""
+
+    if ! wifi="$(active_wifi)"; then
+        last_seen_activation=""
+        rm -f "$opened_file"
+        return 0
+    fi
+
+    IFS=$'\t' read -r activation profile <<<"$wifi"
+
+    if [[ "$force" == "yes" || "$activation" != "$last_seen_activation" ]]; then
+        state="$(LC_ALL=C nmcli networking connectivity check 2>/dev/null || true)"
+        last_seen_activation="$activation"
+    else
+        state="$(LC_ALL=C nmcli -g CONNECTIVITY general status 2>/dev/null || true)"
+    fi
+
+    [[ "$state" == "portal" ]] || return 0
+
+    mkdir -p "$state_dir"
+    [[ -r "$opened_file" ]] && IFS= read -r opened < "$opened_file"
+    [[ "$opened" != "$activation" ]] || return 0
+
+    printf '%s\n' "$activation" > "$opened_file"
+    open_portal "$profile"
+}
+
+case "${1:-monitor}" in
+    monitor)
+        check_connectivity yes
+        while true; do
+            while IFS= read -r _; do
+                check_connectivity
+            done < <(LC_ALL=C stdbuf -oL nmcli monitor 2>&1)
+            sleep 1
+        done
+        ;;
+    check)
+        check_connectivity yes
+        ;;
+    open)
+        profile="$(active_wifi 2>/dev/null || true)"
+        profile="${profile#*$'\t'}"
+        open_portal "${profile:-Wi-Fi}"
+        ;;
+    *)
+        printf 'Usage: %s {monitor|check|open}\n' "${0##*/}" >&2
+        exit 2
+        ;;
+esac

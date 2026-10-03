@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyprland captive portal login helper
+Documentation=https://networkmanager.dev/docs/api/latest/NetworkManager.conf.html#connectivity-section
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hypr-captive-portal monitor
+Restart=on-failure
+RestartSec=1
+KillMode=control-group
+SuccessExitStatus=143 SIGTERM
+
+[Install]
+WantedBy=graphical-session.target

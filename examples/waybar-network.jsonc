@@ -1,0 +1,14 @@
+{
+  "network": {
+    "interval": 1,
+    "format-wifi": "󰤨  {essid}",
+    "format-ethernet": "󰈀  LAN",
+    "format-linked": "󰈀  LINK",
+    "format-disconnected": "󰤭  OFFLINE",
+    "tooltip-format-wifi": "{essid}\n{ifname} · {ipaddr}/{cidr}\nSignal {signalStrength}%\nDownload {bandwidthDownBytes}\nUpload {bandwidthUpBytes}\nLeft: networks · Right: tools · Middle: portal",
+    "tooltip-format-ethernet": "{ifname} · {ipaddr}/{cidr}\nDownload {bandwidthDownBytes}\nUpload {bandwidthUpBytes}",
+    "on-click": "hypr-network-menu",
+    "on-click-right": "hypr-network-menu --tools",
+    "on-click-middle": "hypr-captive-portal open"
+  }
+}
