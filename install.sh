@@ -7,7 +7,7 @@ bin_dir="${HOME}/.local/bin"
 unit_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 app_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
 
-required=(nmcli busctl xdg-open notify-send python3 systemctl)
+required=(nmcli ip xdg-open notify-send python3 systemctl)
 missing=()
 for command in "${required[@]}"; do
     command -v "$command" >/dev/null 2>&1 || missing+=("$command")

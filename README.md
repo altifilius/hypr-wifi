@@ -6,14 +6,15 @@ GTK 4, libadwaita, and libnm.
 ## Features
 
 - Live, signal-sorted list of nearby Wi-Fi networks
-- Saved-network reuse and open-network connection without password prompts
+- Dedicated connected-network card with immediate disconnect control
+- Saved-network reuse, profile deletion, and open-network connection without password prompts
 - WPA2/WPA3 password dialog with credentials sent through libnm/D-Bus
 - Separate **Tools** tab for Wi-Fi radio control and hotspot management
 - WPA2 hotspot creation with generated editable passwords
 - Hidden-network and advanced profile entry points
-- Captive portal detection, notification, and automatic browser launch
-- Single-instance application behavior
-- Waybar left/right/middle-click integration
+- Multi-probe captive portal detection, notification, and automatic browser launch
+- Single-instance application behavior with debounced NetworkManager updates
+- Waybar left/right/middle-click integration and live transfer rates
 
 ## Security model
 
@@ -22,10 +23,11 @@ arguments. Credentials are passed to NetworkManager through libnm. Existing
 NetworkManager profiles are reused when possible. Enterprise and legacy
 authentication can use `nm-applet` as the NetworkManager secret agent.
 
-The captive portal helper opens only NetworkManager's configured plain-HTTP
-connectivity-check URI. This lets the access point redirect the browser without
-requiring TLS certificate bypasses. Never ignore a certificate warning on a
-public network.
+The captive portal helper uses plain-HTTP connectivity probes from Mozilla,
+Ubuntu, Google, and Microsoft. Redirects or replaced responses identify a
+portal; the active Wi-Fi gateway is tried only when every public probe is
+unreachable. This permits portal redirection without bypassing TLS certificate
+validation. Never ignore a certificate warning on a public network.
 
 ## Requirements
 
@@ -33,14 +35,14 @@ public network.
 - Python 3 and PyGObject
 - GTK 4 and libadwaita
 - libnm GObject introspection bindings
-- `libnotify`, `xdg-utils`, and systemd
+- `iproute2`, `libnotify`, `xdg-utils`, and systemd
 - Optional: `network-manager-applet` for enterprise/legacy secret prompts
 
 Arch Linux package names:
 
 ```sh
 sudo pacman -S --needed networkmanager python-gobject gtk4 libadwaita \
-  libnotify xdg-utils network-manager-applet
+  iproute2 libnotify xdg-utils network-manager-applet
 ```
 
 The Wi-Fi adapter must advertise AP capability for hotspot creation:
@@ -82,7 +84,7 @@ hl.bind("SUPER + N", hl.dsp.exec_cmd("hypr-network-menu"))
 ```
 
 Match the application class `io.github.altifilius.HyprWifi` and apply a
-`620x700` centered floating rule.
+`620x720` centered floating rule.
 
 ## Usage
 
@@ -90,11 +92,13 @@ Match the application class `io.github.altifilius.HyprWifi` and apply a
 hypr-network-menu          # nearby networks
 hypr-network-menu --tools  # hotspot and advanced tools
 
-hypr-captive-portal check  # force a NetworkManager connectivity check
-hypr-captive-portal open   # open the configured portal probe manually
+hypr-captive-portal check  # detect and open a portal, ignoring activation deduplication
+hypr-captive-portal open   # force the detected portal or HTTP fallback page to open
 ```
 
-The portal monitor normally runs through:
+The portal monitor follows NetworkManager connectivity changes and actively
+probes when NetworkManager reports portal, limited, unknown, or no connectivity.
+It normally runs through:
 
 ```sh
 systemctl --user status hypr-captive-portal.service
@@ -117,8 +121,8 @@ Waybar and Hyprland snippets are intentionally left untouched.
 ## Verification
 
 ```sh
-python -m py_compile bin/hypr-network-menu
-bash -n bin/hypr-captive-portal install.sh uninstall.sh
+python -m py_compile bin/hypr-network-menu bin/hypr-captive-portal
+bash -n install.sh uninstall.sh
 systemd-analyze --user verify systemd/hypr-captive-portal.service
 ```
 

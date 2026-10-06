@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 — 2026-10-06
+
+- Prevent the multi-probe detector from treating an ordinary router admin page as a portal after successful public probes.
+- Resolve the gateway through the active Wi-Fi interface instead of assuming `wlan0`.
+- Make `check` bypass activation deduplication without opening a fallback when no portal is detected.
+- Update installation dependencies, verification commands, documentation, and the 620×720 window rule.
+
 ## 1.1.0 — 2026-10-03
 
 - Add dedicated connected-network status card with instant disconnect button.
